@@ -1,0 +1,263 @@
+---
+title: "Age and Covid-19 outcomes"
+author: Holden Huntzinger
+output: html_document
+---
+
+Acknowledgements: My data came from https://www.kaggle.com/tanmoyx/covid19-patient-precondition-dataset?select=covid.csv. Thanks to Kaggle user Tanmoy Mukherjee for translating, cleaning, and uploading this data, which they originally found released publicly by the Mexican government at https://www.gob.mx/salud/documentos/datos-abiertos-152127.  
+
+```{r, echo=F, include=FALSE}
+library(tidyverse)
+library(infer)
+```
+
+
+My goal here is to analyze the relationship between age and mortality of Covid-19 patients in this dataset. 
+
+# Exploration
+
+First, I'll reformat the entry_date values for easier analysis, add a binary column called death, and make sure empty values show up appropriately. 
+
+I see 566,602 observations of 24 variables focusing on admissions, outcomes, and pre-existing conditions of patients diagnosed with Covid-19 in Mexican hospitals. 
+
+```{r}
+covid_data = read.csv("covid.csv")
+
+# take 10,000 results randomly from the larger sample to speed up the rest of the code
+covid_data = sample_n(covid_data, 10000)
+
+covid_data = covid_data %>%
+  mutate(entry_date = as.Date(entry_date, "%d-%m-%y")) %>%
+  mutate(death = ifelse(covid_data$date_died == "9999-99-99", FALSE, TRUE))
+
+covid_data[covid_data == 98] <- NA
+covid_data$date_died = na_if(covid_data$date_died, "9999-99-99")
+
+glimpse(covid_data)
+```
+
+Let's look at some descriptive statistics to get a better sense of the data we're working with. We can get a basic sense of when these records are from and how commonly patients saw negative outcomes after hospitalization.
+
+```{r}
+
+covid_data %>%
+  summarize(first_date = min(entry_date),
+            last_date = max(entry_date),
+            last_death = max(date_died, na.rm=T))
+
+```
+It looks like this data covers the first 6 months of 2020. About 6.4% of these patients died, but it seems significant that the last death date recorded here is at the end of May. Is it possible that no one died in the month of June? It seems more likely to me that deaths occurring after a certain point are not recorded here. It's OK that we're using imperfect data, but we should always watch out for and note its limitations. 
+
+Next, let's look at changes in case rates over time to get a sense of the temporality of this data.
+
+```{r}
+
+cases_per_week = covid_data %>%
+  mutate(week = cut.Date(entry_date, breaks = "1 week", labels = FALSE)) %>%
+  group_by(week) %>%
+  tally()
+
+ggplot(cases_per_week, aes(x=week, y=n)) +
+  geom_col() + 
+  labs(x='Week (Starting 1/1/20)', y='Number of Cases', title='Covid Cases in Mexico')
+
+```
+
+As we might expect remembering the trajectory of the pandemic in many other countries, there are very few records before week 10 (which is the week of March 11). Then, case numbers skyrocketed, aided by sudden awareness and testing capabilities. SARS-CoV-2 was spreading rapidly, but it's worth remembering that this spread is only measured when cases of Covid-19 are diagnosed. 
+
+# The Hypothesis
+
+I've heard and read consistently that age is one important factor in determining how hard Covid-19 will hit someone. Young people still see awful outcomes, and plenty of older people just cough for a few days and are fine, but mostly age seems to matter. 
+
+I want to prove it for myself, though. Based on what I hear in the news, I'll start with the hypothesis that younger people will be less likely to die from Covid-19 after being hospitalized, and that this dataset will demonstrate this fact. 
+
+We'll set a confidence interval at 0.95, meaning if we find that 95% of samples would tell us the same result, we feel comfortable saying we have confirmed our hypothesis. 
+
+# Description and Visualization
+
+Let's start by checking out the average ages of people who died after being hospitalized and those who didn't.
+
+```{R}
+
+covid_data %>%
+  group_by(death) %>%
+  summarize(mean_age_survived = mean(age, na.rm=T))
+
+```
+
+Box plots can be a helpful way to visualize data like this and to check for outliers. 
+
+```{R}
+
+ggplot(covid_data, aes(x=death, y=age)) + 
+  geom_boxplot() + 
+  labs(title = "Covid Patient Ages by Mortality Status")
+
+```
+
+We can see the different medians (which look quite similar to the means we calculated above) here clearly, but there are SO many outliers! Let's quickly learn more about some of those.
+
+```{R}
+
+covid_data %>%
+  summarize(min_age = min(age, na.rm=T),
+            max_age = max(age, na.rm=T))
+
+```
+
+These numbers seem pretty normal. 107 is old, but not unheard of. Let's visualize the age distribution of this sample to learn more.
+
+```{R}
+
+covid_age = covid_data %>%
+  group_by(age) %>%
+  ggplot(aes(x=age)) + 
+  geom_bar()
+
+covid_age
+
+```
+
+It's worthwhile to note that this isn't a random sample of people - it's a random sample of people who were hospitalized. One result of this selection process is that people of all ages aren't equally represented.
+
+Now that we understand these caveats and limitations, we can move ahead with this analysis. 
+
+# Proving the Connection
+
+So, it seems like younger people were less likely to die from Covid. But we haven't proven anything just by looking at some graphs. First, we're only looking at about 566,000 observations! Though that's a lot of people to invite to your birthday party, another quick Google search just told me there are nearly 130 million people living in Mexico. Can we say something is true for all Mexicans - or even all (nearly) 8 billion people in the world - based on only a sample of half a million people? 
+
+Well, to start, we can learn more about how representative our sample is. One method is called bootstrapping, where we'll take a bunch of smaller samples form our original sample of 566,000 people. If these smaller samples mostly bear out the same connection, we can extrapolate this correlation to the larger population with a bit more confidence. 
+
+Let's first pare down our original data (just so our next steps can run a bit quicker). We'll end up with 2 columns: 1 for age, and one called 'survived,' for which a "TRUE" value means the patient didn't have a date of death in our original data. 
+
+```{R}
+
+covid_small = covid_data %>%
+  select(age) %>%
+  mutate(survived = ifelse(covid_data$death == TRUE, "yes", "no"))
+
+glimpse(covid_small)
+
+```
+
+I expect that this difference will be statistically significant, but let's find out. We can calculate the exact difference in means using tidyverse functions.
+
+```{R}
+
+obs_diff_means <- covid_small %>% 
+  specify(age ~ survived) %>% 
+  calculate(stat = "diff in means", order = c("yes", "no")) 
+obs_diff_means
+
+```
+
+It looks like there's an average age difference of about 18.74 years between patients who died and those who didn't. In other words, the average patient without a death data listed in this dataset is about 18.74 years younger that the average patient with a listed date of death.
+
+The next step is to look at how likely a difference this big would be. By taking smaller samples from within this dataset, we can get a better idea of how much different samples would vary. Perhaps, because of the specifics and size of this dataset, different samples would have wildly ranging differences in means. In other words, it's possible that this 16.4-year age difference is just random chance. Maybe that isn't true of most other samples. 
+
+To find out, we'll calculate a null distribution. We'll take 10,000 smaller samples from this dataset and test them the same way to see how much variation there is. 
+
+```{R}
+
+null_distribution_covid <- covid_small %>% 
+  specify(formula = age ~ survived) %>% 
+  hypothesize(null = "independence") %>%
+  generate(reps = 10000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("yes", "no")) 
+
+glimpse(null_distribution_covid)
+
+```
+
+You can see that each replicate (each new sample) has its own stat - this is the difference in average ages between patients who died and patients who didn't. These numbers look much smaller than our 16.4-year difference, so it seems like we might rule in favor of the original hypothesis that patients who die of Covid tend to be older than those who don't. 
+
+We can make a graph of these samples, too, with the visualize function. 
+
+```{R}
+
+visualize(null_distribution_covid, bins = 10)
+
+```
+
+The graph above shows that, if we assumed our null hypothesis of no relationship between our death and age variables, there would still be some variation in our samples. Some samples would show a difference as big as 4 or 5 years in average age, even though a larger sample or higher number of samples would demonstrate the larger truth. 
+
+We can calculate a p-value based on this null distribution. This represents the likelihood that we'd get a difference in means as high as ours (18.74 years) if our null hypothesis were true (if there were no relationship between age and death in this data). 
+
+```{R}
+
+null_distribution_covid %>% 
+  get_p_value(obs_stat = obs_diff_means, direction = "both")
+
+```
+
+Our p-value was calculated as 0. While this isn't literally true -- we're rounding here to get a value of 0 -- it shows that it is incredibly unlikely that the relationship we're seeing is just random chance. It's technically possible, but we can be pretty sure of this relationship. 
+
+# Confidence Interval
+
+Next, we'll find a confidence interval. We think our observed statistic is significant - we're think, with high confidence, that there is a real relationship between age and death in this dataset. But is our 16.4 number exactly right? As we saw when visualizing our null distribution, there's natural variation between samples. 
+
+In order to find a confidence interval, which represents the likely true value of this relationship, we'll first take a bootstrap distribution. This is a series of sub-samples from our data that will each have its own difference in means. 
+
+```{R}
+
+bootstrap_distribution <- covid_small %>% 
+  specify(formula = age ~ survived) %>% 
+  generate(reps = 10000, type = "bootstrap") %>% 
+  calculate(stat = "diff in means", order = c("yes", "no")) 
+
+glimpse(bootstrap_distribution)
+
+```
+
+We can visualize this relationship, too.
+  
+```{R}
+
+visualise(bootstrap_distribution) + 
+  shade_p_value(obs_stat = obs_diff_means, direction = "both")
+
+```
+
+We see a very similar pattern -- normal distribution -- as we did with our null distribution. The red line here represents our observed statistic at 16.4. That was the difference in average age between our two groups. 
+
+Let's calculate our confidence interval using the 95% number we decided on above.
+
+```{R}
+
+percentile_ci <- bootstrap_distribution %>% 
+  get_confidence_interval(level = 0.95, type = "percentile")
+
+percentile_ci
+
+```
+And visualize it, as well..
+
+```{R}
+
+visualize(bootstrap_distribution) + 
+  shade_confidence_interval(endpoints = percentile_ci)  +
+  shade_p_value(obs_stat = obs_diff_means, direction = "both")
+
+```
+
+This graph shows our bootstrapped samples by the difference in means (difference in average age based on whether the patient died). Our observed difference is represented by the red line and the green shading shows our confidence interval.
+
+# Conclusion
+
+After all of this statistical work, what have we decided?
+
+First, we found that there is a significant relationship between age and death in our original dataset. Patients who died in the hospital, according to this public dataset from the Mexican government, were older than patients who didn't. 
+
+This work doesn't quite mean that we can extrapolate this relationship to the rest of the world or say that there's a direct causal relationship here. We have discovered a correlation that aligns with our hypothesis, but we also had to acknowledge along the way that this dataset has serious limitations. It didn't track all deaths, was mediated by a random Kaggle user, and came from very early in the pandemic when governments the world over were struggling to respond and track impacts.
+
+Thankfully, other scientists have done loads of research on this effect, so we do know that older people are at higher risk of death from Covid-19. Knowing this meant we could prioritize vaccines and make appropriate public health recommendations. 
+
+
+
+
+
+
+
+
+
+
